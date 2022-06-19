@@ -7,11 +7,13 @@
   <body>
     <script src="audiobuffer-to-wav/index.js"></script>
     <script>
+        var ENABLE_AUDIO_DOWNLOAD = false;
+
         var activeModel;
         var activeModelStream;
         var activeRecordingData;
         var audioContext;
-        var audioProcessor;
+        var audioWorkletNode;
         var mediaStream;
         var mediaStreamSource;
 
@@ -19,40 +21,6 @@
         function converFloat32ToInt16(buffer) {
             return Int16Array.from(buffer, x => x * 32767);
         }
-
-        function createAudioProcessor() {
-            audioProcessor = audioContext.createScriptProcessor(8192, 1, 1);
-                                    
-            audioProcessor.onaudioprocess = (event) => {
-                // Decode intermediate results on each sample 
-                const transcription = activeModelStream.intermediateDecode();
-                document.getElementById("result").textContent = transcription;
-                console.log(`Intermediate transcription: ${transcription}`);
-                
-                // Accumulate audio data by allocating a new buffer
-                var monoAudioData = event.inputBuffer.getChannelData(0);
-                const mergedData = new Float32Array(activeRecordingData.length + monoAudioData.length);
-                mergedData.set(activeRecordingData);
-                mergedData.set(monoAudioData, activeRecordingData.length);
-                activeRecordingData = mergedData;
-        
-                const processedAudio = converFloat32ToInt16(monoAudioData);
-                // Convert the `processedAudio` to something that can be passed
-                // across the WASM boundaries.
-                const toPass = new Module.VectorShort();
-                processedAudio.forEach(e => toPass.push_back(e));
-
-                // Feed the processed audio to the model stream
-                activeModelStream.feedAudioContent(toPass);
-            };
-            
-            audioProcessor.shutdown = () => {
-                audioProcessor.disconnect();
-                audioProcessor.onaudioprocess = null;
-            };
-            
-            audioProcessor.connect(audioContext.destination);            
-        };
 
         function loadModel(modelFiles) {
             console.log(`Loading models`, modelFiles);
@@ -69,7 +37,7 @@
 
                 // Now that a model is available, enable audio input selection (file or microphone).
                 const audioFileInput = document.getElementById("audiopicker");
-                audioFileInput.addEventListener("change", (e) => processAudio(e.target.files[0]), false);
+                audioFileInput.addEventListener("change", (e) => processAudioFromFile(e.target.files[0]), false);
                 audioFileInput.disabled = false;
 
                 const downloadAudioLink = document.getElementById("downloadAudioLink");
@@ -78,14 +46,14 @@
                 
                 startRecordingButton.disabled = false;
                 startRecordingButton.addEventListener("click", (e) => {
-                    downloadAudioLink.style.display = "none";
+                    if (ENABLE_AUDIO_DOWNLOAD) downloadAudioLink.style.display = "none";
                     startRecordingButton.disabled = true;
                     stopRecordingButton.disabled = false;
 
                     startRecording();
                 }, false);
                 stopRecordingButton.addEventListener("click", (e) => {
-                    downloadAudioLink.style.display = "block";
+                    if (ENABLE_AUDIO_DOWNLOAD) downloadAudioLink.style.display = "block";
                     startRecordingButton.disabled = false;
                     stopRecordingButton.disabled = true;
                     
@@ -106,7 +74,39 @@
             reader.readAsArrayBuffer(scorerFile);
         };
 
-        function startRecording() {
+        function onAudioProcess(leftChannelData) {
+            // Decode intermediate results on each sample 
+            const transcription = activeModelStream.intermediateDecode();
+            document.getElementById("result").textContent = transcription;
+            console.log(`Intermediate transcription: ${transcription}`);
+            
+            // Accumulate audio data by allocating a new buffer
+            if (ENABLE_AUDIO_DOWNLOAD) {
+                const floatleftChannelData = Float32Array.from(leftChannelData, x => x/32767);
+                const mergedData = new Float32Array(activeRecordingData.length + floatleftChannelData.length);
+                mergedData.set(activeRecordingData);
+                mergedData.set(floatleftChannelData, activeRecordingData.length);
+                activeRecordingData = mergedData;
+            }
+    
+            // Convert the `leftChannelData` to something that can be passed
+            // across the WASM boundaries.
+            const toPass = new Module.VectorShort();
+            leftChannelData.forEach(e => toPass.push_back(e));
+
+            // Feed the processed audio to the model stream
+            activeModelStream.feedAudioContent(toPass);
+        }
+        
+        async function setupAudioWorklet() {
+            await audioContext.audioWorklet.addModule('stt-audio-processor.js');
+            audioWorkletNode = new AudioWorkletNode(audioContext, 'stt-audio-processor');
+            audioWorkletNode.port.onmessage = (event) => {
+                onAudioProcess(event.data);
+            };
+        }
+
+        async function startRecording() {
             activeModelStream = activeModel.createStream();
             
             const modelSampleRate = activeModel.getSampleRate();
@@ -115,14 +115,17 @@
                 // Use the model's sample rate so that the decoder will resample for us.
                 sampleRate: modelSampleRate
             });
+
+            await setupAudioWorklet();
             
-            const onSuccess = (stream) => {
+            const onSuccess = async (stream) => {
                 console.log('started recording');
                 activeRecordingData = [];
                 mediaStream = stream;
                 mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
-                createAudioProcessor();
-                mediaStreamSource.connect(audioProcessor);
+                
+                audioWorkletNode.connect(audioContext.destination);
+                mediaStreamSource.connect(audioWorkletNode);
             };
             
             const onError = (error) => {
@@ -146,36 +149,37 @@
         };
 	
         function stopRecording() {
+            // Free audio worklet resources and message listener
+            audioWorkletNode.port.postMessage({release: true});
+            audioWorkletNode.port.onmessage = null;
+            audioWorkletNode.port.close();
+            audioWorkletNode = null;
+    
+            // Free stream and audioContext resources
+            mediaStream.getTracks()[0].stop();
+            mediaStreamSource.disconnect();
+            audioContext.close();
+    
+            // Get the final transcription results
             const transcription = activeModelStream.finishStream();
             document.getElementById("result").textContent = transcription;
             console.log(`Transcription: ${transcription}`);
 
-            const modelSampleRate = activeModel.getSampleRate();
-            // TODO: handle different bit widths and more than one channel?
-            var audioUrl = URL.createObjectURL(
-                new Blob([encodeWAV(activeRecordingData, 1, modelSampleRate, 1, 16)], 
-                {type: "audio/wav"})
-            );
-            var downloadAudioEl = document.getElementById("downloadAudioLink");
-            downloadAudioEl.href = audioUrl;
+            if (ENABLE_AUDIO_DOWNLOAD) {
+                const modelSampleRate = activeModel.getSampleRate();
+                // TODO: handle different bit widths and more than one channel?
+                var audioUrl = URL.createObjectURL(
+                    new Blob([encodeWAV(activeRecordingData, 1, modelSampleRate, 1, 16)], 
+                    {type: "audio/wav"})
+                );
+                var downloadAudioEl = document.getElementById("downloadAudioLink");
+                downloadAudioEl.href = audioUrl;
+            }
 
             activeModelStream = null;
-
-            if (mediaStream) {
-                mediaStream.getTracks()[0].stop();
-            }
-            if (mediaStreamSource) {
-                mediaStreamSource.disconnect();
-            }
-            if (audioProcessor) {
-                audioProcessor.shutdown();
-            }
-            if (audioContext) {
-                audioContext.close();
-            }
         };
 
-        function processAudio(audioFile) {
+        function processAudioFromFile(audioFile) {
             console.log(`Loading audio file`, audioFile);
             
             const modelSampleRate = activeModel.getSampleRate();

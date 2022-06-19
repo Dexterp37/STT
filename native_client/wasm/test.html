@@ -5,14 +5,54 @@
     <title>WASM Sample</title>
   </head>
   <body>
+    <script src="audiobuffer-to-wav/index.js"></script>
     <script>
         var activeModel;
+        var activeModelStream;
+        var activeRecordingData;
         var audioContext;
+        var audioProcessor;
+        var mediaStream;
+        var mediaStreamSource;
 
         // https://stackoverflow.com/q/33738873/261698
         function converFloat32ToInt16(buffer) {
             return Int16Array.from(buffer, x => x * 32767);
         }
+
+        function createAudioProcessor() {
+            audioProcessor = audioContext.createScriptProcessor(8192, 1, 1);
+                                    
+            audioProcessor.onaudioprocess = (event) => {
+                // Decode intermediate results on each sample 
+                const transcription = activeModelStream.intermediateDecode();
+                document.getElementById("result").textContent = transcription;
+                console.log(`Intermediate transcription: ${transcription}`);
+                
+                // Accumulate audio data by allocating a new buffer
+                var monoAudioData = event.inputBuffer.getChannelData(0);
+                const mergedData = new Float32Array(activeRecordingData.length + monoAudioData.length);
+                mergedData.set(activeRecordingData);
+                mergedData.set(monoAudioData, activeRecordingData.length);
+                activeRecordingData = mergedData;
+        
+                const processedAudio = converFloat32ToInt16(monoAudioData);
+                // Convert the `processedAudio` to something that can be passed
+                // across the WASM boundaries.
+                const toPass = new Module.VectorShort();
+                processedAudio.forEach(e => toPass.push_back(e));
+
+                // Feed the processed audio to the model stream
+                activeModelStream.feedAudioContent(toPass);
+            };
+            
+            audioProcessor.shutdown = () => {
+                audioProcessor.disconnect();
+                audioProcessor.onaudioprocess = null;
+            };
+            
+            audioProcessor.connect(audioContext.destination);            
+        };
 
         function loadModel(modelFiles) {
             console.log(`Loading models`, modelFiles);
@@ -23,20 +63,34 @@
                 const modelSampleRate = activeModel.getSampleRate();
                 console.log(`Model sample rate: ${modelSampleRate}`);
 
-                // Create an audio context for future processing.
-                audioContext = new AudioContext({
-                    // Use the model's sample rate so that the decoder will resample for us.
-                    sampleRate: modelSampleRate
-                });
-
                 const scorerInput = document.getElementById("scorerpicker");
                 scorerInput.addEventListener("change", (e) => loadScorer(e.target.files[0]), false);
                 scorerInput.disabled = false;
 
-                // Now that a model is available, enable opening the audio file.
-                const audioInput = document.getElementById("audiopicker");
-                audioInput.addEventListener("change", (e) => processAudio(e.target.files[0]), false);
-                audioInput.disabled = false;
+                // Now that a model is available, enable audio input selection (file or microphone).
+                const audioFileInput = document.getElementById("audiopicker");
+                audioFileInput.addEventListener("change", (e) => processAudio(e.target.files[0]), false);
+                audioFileInput.disabled = false;
+
+                const downloadAudioLink = document.getElementById("downloadAudioLink");
+                const startRecordingButton = document.getElementById("startRecordingButton");
+                const stopRecordingButton = document.getElementById("stopRecordingButton");
+                
+                startRecordingButton.disabled = false;
+                startRecordingButton.addEventListener("click", (e) => {
+                    downloadAudioLink.style.display = "none";
+                    startRecordingButton.disabled = true;
+                    stopRecordingButton.disabled = false;
+
+                    startRecording();
+                }, false);
+                stopRecordingButton.addEventListener("click", (e) => {
+                    downloadAudioLink.style.display = "block";
+                    startRecordingButton.disabled = false;
+                    stopRecordingButton.disabled = true;
+                    
+                    stopRecording();
+                }, false);
             };
             reader.readAsArrayBuffer(modelFiles[0]);
         };
@@ -52,8 +106,84 @@
             reader.readAsArrayBuffer(scorerFile);
         };
 
+        function startRecording() {
+            activeModelStream = activeModel.createStream();
+            
+            const modelSampleRate = activeModel.getSampleRate();
+            // Create an audio context for future processing.
+            audioContext = new AudioContext({
+                // Use the model's sample rate so that the decoder will resample for us.
+                sampleRate: modelSampleRate
+            });
+            
+            const onSuccess = (stream) => {
+                console.log('started recording');
+                activeRecordingData = [];
+                mediaStream = stream;
+                mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
+                createAudioProcessor();
+                mediaStreamSource.connect(audioProcessor);
+            };
+            
+            const onError = (error) => {
+                console.error('recording failure', error);
+            };
+            
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                navigator.mediaDevices.getUserMedia({
+                    video: false,
+                    audio: true
+                })
+                .then(onSuccess)
+                .catch(onError);
+            }
+            else {
+                navigator.getUserMedia({
+                    video: false,
+                    audio: true
+                }, onSuccess, onError);
+            }
+        };
+	
+        function stopRecording() {
+            const transcription = activeModelStream.finishStream();
+            document.getElementById("result").textContent = transcription;
+            console.log(`Transcription: ${transcription}`);
+
+            const modelSampleRate = activeModel.getSampleRate();
+            // TODO: handle different bit widths and more than one channel?
+            var audioUrl = URL.createObjectURL(
+                new Blob([encodeWAV(activeRecordingData, 1, modelSampleRate, 1, 16)], 
+                {type: "audio/wav"})
+            );
+            var downloadAudioEl = document.getElementById("downloadAudioLink");
+            downloadAudioEl.href = audioUrl;
+
+            activeModelStream = null;
+
+            if (mediaStream) {
+                mediaStream.getTracks()[0].stop();
+            }
+            if (mediaStreamSource) {
+                mediaStreamSource.disconnect();
+            }
+            if (audioProcessor) {
+                audioProcessor.shutdown();
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+        };
+
         function processAudio(audioFile) {
             console.log(`Loading audio file`, audioFile);
+            
+            const modelSampleRate = activeModel.getSampleRate();
+            // Create an audio context for future processing.
+            audioContext = new AudioContext({
+                // Use the model's sample rate so that the decoder will resample for us.
+                sampleRate: modelSampleRate
+            });
 
             let reader = new FileReader();
             reader.onload = (e) => {
@@ -91,6 +221,8 @@
     </script>
     <script src="build/stt_wasm.js"></script>
     <div>
+        <h3>Model Inputs</h3>
+
         <label for="modelpicker">Coqui TFLite Model file:</label>
         <input type="file" name="modelpicker" id="modelpicker" disabled>
 
@@ -101,11 +233,18 @@
 
         <br />
 
+        <h3>Audio input</h3>
         <label for="audiopicker">Audio sample file:</label>
         <input type="file" name="audiopicker" id="audiopicker" disabled>
 
+        <p>OR</p>
+        <button type="button" id="startRecordingButton" disabled>Start Record</button>
+        <button type="button" id="stopRecordingButton" disabled>Stop Recording</button>
+        <a id="downloadAudioLink" download="audio.wav" style="display: none;">Download audio</a>
+
         <br />
 
+        <h3>Transcription Ouput</h3>
         <label for="result">Transcription:</label>
         <span id="result"></span>
 

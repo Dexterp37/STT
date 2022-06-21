@@ -5,9 +5,17 @@
     <title>WASM Sample</title>
   </head>
   <body>
+    <script src="audiobuffer-to-wav/index.js"></script>
     <script>
+        var ENABLE_AUDIO_DOWNLOAD = false;
+
         var activeModel;
+        var activeModelStream;
+        var activeRecordingData;
         var audioContext;
+        var audioWorkletNode;
+        var mediaStream;
+        var mediaStreamSource;
 
         // https://stackoverflow.com/q/33738873/261698
         function converFloat32ToInt16(buffer) {
@@ -23,20 +31,34 @@
                 const modelSampleRate = activeModel.getSampleRate();
                 console.log(`Model sample rate: ${modelSampleRate}`);
 
-                // Create an audio context for future processing.
-                audioContext = new AudioContext({
-                    // Use the model's sample rate so that the decoder will resample for us.
-                    sampleRate: modelSampleRate
-                });
-
                 const scorerInput = document.getElementById("scorerpicker");
                 scorerInput.addEventListener("change", (e) => loadScorer(e.target.files[0]), false);
                 scorerInput.disabled = false;
 
-                // Now that a model is available, enable opening the audio file.
-                const audioInput = document.getElementById("audiopicker");
-                audioInput.addEventListener("change", (e) => processAudio(e.target.files[0]), false);
-                audioInput.disabled = false;
+                // Now that a model is available, enable audio input selection (file or microphone).
+                const audioFileInput = document.getElementById("audiopicker");
+                audioFileInput.addEventListener("change", (e) => processAudioFromFile(e.target.files[0]), false);
+                audioFileInput.disabled = false;
+
+                const downloadAudioLink = document.getElementById("downloadAudioLink");
+                const startRecordingButton = document.getElementById("startRecordingButton");
+                const stopRecordingButton = document.getElementById("stopRecordingButton");
+                
+                startRecordingButton.disabled = false;
+                startRecordingButton.addEventListener("click", (e) => {
+                    if (ENABLE_AUDIO_DOWNLOAD) downloadAudioLink.style.display = "none";
+                    startRecordingButton.disabled = true;
+                    stopRecordingButton.disabled = false;
+
+                    startRecording();
+                }, false);
+                stopRecordingButton.addEventListener("click", (e) => {
+                    if (ENABLE_AUDIO_DOWNLOAD) downloadAudioLink.style.display = "block";
+                    startRecordingButton.disabled = false;
+                    stopRecordingButton.disabled = true;
+                    
+                    stopRecording();
+                }, false);
             };
             reader.readAsArrayBuffer(modelFiles[0]);
         };
@@ -52,8 +74,120 @@
             reader.readAsArrayBuffer(scorerFile);
         };
 
-        function processAudio(audioFile) {
+        function onAudioProcess(leftChannelData) {
+            // Decode intermediate results on each sample 
+            const transcription = activeModelStream.intermediateDecode();
+            document.getElementById("result").textContent = transcription;
+            console.log(`Intermediate transcription: ${transcription}`);
+            
+            // Accumulate audio data by allocating a new buffer
+            if (ENABLE_AUDIO_DOWNLOAD) {
+                const floatleftChannelData = Float32Array.from(leftChannelData, x => x/32767);
+                const mergedData = new Float32Array(activeRecordingData.length + floatleftChannelData.length);
+                mergedData.set(activeRecordingData);
+                mergedData.set(floatleftChannelData, activeRecordingData.length);
+                activeRecordingData = mergedData;
+            }
+    
+            // Convert the `leftChannelData` to something that can be passed
+            // across the WASM boundaries.
+            const toPass = new Module.VectorShort();
+            leftChannelData.forEach(e => toPass.push_back(e));
+
+            // Feed the processed audio to the model stream
+            activeModelStream.feedAudioContent(toPass);
+        }
+        
+        async function setupAudioWorklet() {
+            await audioContext.audioWorklet.addModule('stt-audio-processor.js');
+            audioWorkletNode = new AudioWorkletNode(audioContext, 'stt-audio-processor');
+            audioWorkletNode.port.onmessage = (event) => {
+                onAudioProcess(event.data);
+            };
+        }
+
+        async function startRecording() {
+            activeModelStream = activeModel.createStream();
+            
+            const modelSampleRate = activeModel.getSampleRate();
+            // Create an audio context for future processing.
+            audioContext = new AudioContext({
+                // Use the model's sample rate so that the decoder will resample for us.
+                sampleRate: modelSampleRate
+            });
+
+            await setupAudioWorklet();
+            
+            const onSuccess = async (stream) => {
+                console.log('started recording');
+                activeRecordingData = [];
+                mediaStream = stream;
+                mediaStreamSource = audioContext.createMediaStreamSource(mediaStream);
+                
+                audioWorkletNode.connect(audioContext.destination);
+                mediaStreamSource.connect(audioWorkletNode);
+            };
+            
+            const onError = (error) => {
+                console.error('recording failure', error);
+            };
+            
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                navigator.mediaDevices.getUserMedia({
+                    video: false,
+                    audio: true
+                })
+                .then(onSuccess)
+                .catch(onError);
+            }
+            else {
+                navigator.getUserMedia({
+                    video: false,
+                    audio: true
+                }, onSuccess, onError);
+            }
+        };
+	
+        function stopRecording() {
+            // Free audio worklet resources and message listener
+            audioWorkletNode.port.postMessage({release: true});
+            audioWorkletNode.port.onmessage = null;
+            audioWorkletNode.port.close();
+            audioWorkletNode = null;
+    
+            // Free stream and audioContext resources
+            mediaStream.getTracks()[0].stop();
+            mediaStreamSource.disconnect();
+            audioContext.close();
+    
+            // Get the final transcription results
+            const transcription = activeModelStream.finishStream();
+            document.getElementById("result").textContent = transcription;
+            console.log(`Transcription: ${transcription}`);
+
+            if (ENABLE_AUDIO_DOWNLOAD) {
+                const modelSampleRate = activeModel.getSampleRate();
+                // TODO: handle different bit widths and more than one channel?
+                var audioUrl = URL.createObjectURL(
+                    new Blob([encodeWAV(activeRecordingData, 1, modelSampleRate, 1, 16)], 
+                    {type: "audio/wav"})
+                );
+                var downloadAudioEl = document.getElementById("downloadAudioLink");
+                downloadAudioEl.href = audioUrl;
+            }
+
+            activeModelStream = null;
+        };
+
+        function processAudioFromFile(audioFile) {
             console.log(`Loading audio file`, audioFile);
+            
+            const modelSampleRate = activeModel.getSampleRate();
+            // Create an audio context for future processing.
+            audioContext = new AudioContext({
+                // Use the model's sample rate so that the decoder will resample for us.
+                sampleRate: modelSampleRate
+            });
 
             let reader = new FileReader();
             reader.onload = (e) => {
@@ -91,6 +225,8 @@
     </script>
     <script src="build/stt_wasm.js"></script>
     <div>
+        <h3>Model Inputs</h3>
+
         <label for="modelpicker">Coqui TFLite Model file:</label>
         <input type="file" name="modelpicker" id="modelpicker" disabled>
 
@@ -101,11 +237,18 @@
 
         <br />
 
+        <h3>Audio input</h3>
         <label for="audiopicker">Audio sample file:</label>
         <input type="file" name="audiopicker" id="audiopicker" disabled>
 
+        <p>OR</p>
+        <button type="button" id="startRecordingButton" disabled>Start Record</button>
+        <button type="button" id="stopRecordingButton" disabled>Stop Recording</button>
+        <a id="downloadAudioLink" download="audio.wav" style="display: none;">Download audio</a>
+
         <br />
 
+        <h3>Transcription Ouput</h3>
         <label for="result">Transcription:</label>
         <span id="result"></span>
 
